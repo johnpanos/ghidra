@@ -102,7 +102,7 @@ public class SharedRangeMapDB {
 	 * Frees resources used by this map.
 	 */
 	public void dispose() {
-		synchronized (dbHandle) {
+		try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 			if (rangeTable != null) {
 				try {
 					dbHandle.deleteTable(rangeTable.getName());
@@ -124,7 +124,7 @@ public class SharedRangeMapDB {
 	 * @param value the value to associate with the range.
 	 */
 	public void add(long start, long end, long value) {
-		synchronized (dbHandle) {
+		try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 			//++modCount;
 			try {
 				// Consoldate existing ranges for this value which overlap
@@ -350,7 +350,7 @@ public class SharedRangeMapDB {
 	 * @param value the value to remove.
 	 */
 	public void remove(long value) {
-		synchronized (dbHandle) {
+		try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 			//++modCount;
 			try {
 				Field[] mapKeys = mapTable.findRecords(new LongField(value), MAP_VALUE_COL);
@@ -386,7 +386,7 @@ public class SharedRangeMapDB {
 	 * specified range.
 	 */
 	public Iterator<Field> getValueIterator(long start, long end) {
-		synchronized (dbHandle) {
+		try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 			return new ValueIterator(start, end);
 		}
 	}
@@ -397,7 +397,7 @@ public class SharedRangeMapDB {
 	 * @return IndexRangeIterator
 	 */
 	public IndexRangeIterator getValueRangeIterator(long value) {
-		synchronized (dbHandle) {
+		try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 			try {
 				return new RangeIterator(value);
 			}
@@ -448,7 +448,7 @@ public class SharedRangeMapDB {
 		 */
 		@Override
 		public boolean hasNext() {
-			synchronized (dbHandle) {
+			try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 				try {
 					while (nextValue == null) {
 						DBRecord rec = mapRecIter.next();
@@ -472,7 +472,7 @@ public class SharedRangeMapDB {
 		 */
 		@Override
 		public Field next() {
-			synchronized (dbHandle) {
+			try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 				if (nextValue != null || hasNext()) {
 					Field v = nextValue;
 					nextValue = null;
@@ -506,7 +506,7 @@ public class SharedRangeMapDB {
 		 */
 		@Override
 		public boolean hasNext() {
-			synchronized (dbHandle) {
+			try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 				try {
 					return recordIter.hasNext();
 				}
@@ -522,7 +522,7 @@ public class SharedRangeMapDB {
 		 */
 		@Override
 		public IndexRange next() {
-			synchronized (dbHandle) {
+			try (db.DBHandle.LockScope dbLock = dbHandle.lockWrite()) {
 				try {
 					DBRecord rec = recordIter.next();
 					if (rec != null) {

@@ -47,7 +47,7 @@ public class DBBuffer {
 	 * @throws IOException thrown if an IO error occurs
 	 */
 	public DBBuffer split(int offset) throws IndexOutOfBoundsException, IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			return new DBBuffer(dbh, buf.split(offset));
 		}
@@ -63,7 +63,7 @@ public class DBBuffer {
 	 * @throws IOException thrown if an IO error occurs.
 	 */
 	public void setSize(int size, boolean preserveData) throws IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			buf.setSize(size, preserveData);
 		}
@@ -74,7 +74,7 @@ public class DBBuffer {
 	 * @return this buffers length
 	 */
 	public int length() {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockRead()) {
 			return buf.length();
 		}
 	}
@@ -86,7 +86,7 @@ public class DBBuffer {
 	 * @return buffer ID
 	 */
 	public int getId() {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockRead()) {
 			return buf.getId();
 		}
 	}
@@ -102,7 +102,7 @@ public class DBBuffer {
 	 */
 	public void fill(int startOffset, int endOffset, byte fillByte)
 			throws IndexOutOfBoundsException, IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			buf.fill(startOffset, endOffset, fillByte);
 		}
@@ -118,7 +118,7 @@ public class DBBuffer {
 	 * @throws IOException thrown if an IO error occurs
 	 */
 	public void append(DBBuffer buffer) throws IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			buf.append(buffer.buf);
 		}
@@ -134,7 +134,7 @@ public class DBBuffer {
 	 * underlying storage.
 	 */
 	public byte getByte(int offset) throws IndexOutOfBoundsException, IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockRead()) {
 			dbh.checkIsClosed();
 			return buf.getByte(offset);
 		}
@@ -154,7 +154,7 @@ public class DBBuffer {
 	 */
 	public void get(int offset, byte[] data, int dataOffset, int length)
 			throws IndexOutOfBoundsException, IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockRead()) {
 			dbh.checkIsClosed();
 			buf.get(offset, data, dataOffset, length);
 		}
@@ -168,7 +168,7 @@ public class DBBuffer {
 	 * @throws IOException thrown if IO error occurs.
 	 */
 	public void fill(InputStream in) throws IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			buf.fill(in);
 		}
@@ -189,7 +189,7 @@ public class DBBuffer {
 	 */
 	public void put(int offset, byte[] bytes, int dataOffset, int length)
 			throws IndexOutOfBoundsException, IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			buf.put(offset, bytes, dataOffset, length);
 		}
@@ -208,7 +208,7 @@ public class DBBuffer {
 	 * underlying storage.
 	 */
 	public void put(int offset, byte[] bytes) throws IndexOutOfBoundsException, IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			buf.put(offset, bytes);
 		}
@@ -223,7 +223,7 @@ public class DBBuffer {
 	 * underlying storage.
 	 */
 	public void putByte(int offset, byte b) throws IndexOutOfBoundsException, IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			buf.putByte(offset, b);
 		}
@@ -240,7 +240,7 @@ public class DBBuffer {
 	 * underlying storage.
 	 */
 	public void get(int offset, byte[] data) throws IndexOutOfBoundsException, IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockRead()) {
 			dbh.checkIsClosed();
 			buf.get(offset, data);
 		}
@@ -253,7 +253,7 @@ public class DBBuffer {
 	 * underlying storage. 
 	 */
 	public void delete() throws IOException {
-		synchronized (dbh) {
+		try (DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			dbh.checkTransaction();
 			buf.delete();
 		}

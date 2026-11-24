@@ -39,7 +39,7 @@ public class KeyToRecordIterator implements RecordIterator {
 	 */
 	@Override
 	public boolean hasNext() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			return keyIter.hasNext();
 		}
 	}
@@ -49,7 +49,7 @@ public class KeyToRecordIterator implements RecordIterator {
 	 */
 	@Override
 	public boolean hasPrevious() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			return keyIter.hasPrevious();
 		}
 	}
@@ -59,7 +59,7 @@ public class KeyToRecordIterator implements RecordIterator {
 	 */
 	@Override
 	public DBRecord next() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			try {
 				return table.getRecord(keyIter.next());
 			}
@@ -74,7 +74,7 @@ public class KeyToRecordIterator implements RecordIterator {
 	 */
 	@Override
 	public DBRecord previous() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			try {
 				return table.getRecord(keyIter.previous());
 			}

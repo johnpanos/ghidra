@@ -58,6 +58,10 @@ import ghidra.util.exception.AssertException;
  */
 public class ChainedBuffer implements Buffer {
 
+	// reads share, modifications are exclusive (formerly every method was synchronized)
+	private final java.util.concurrent.locks.ReentrantReadWriteLock rwLock =
+		new java.util.concurrent.locks.ReentrantReadWriteLock();
+
 	// @formatter:off
 	private static final byte[] XOR_MASK_BYTES = new byte[] {
 		(byte)0x59, (byte)0xea, (byte)0x67, (byte)0x23, (byte)0xda, (byte)0xb8, (byte)0x00, (byte)0xb8, 
@@ -339,7 +343,9 @@ public class ChainedBuffer implements Buffer {
 	 * Uninitialized Data Source or is read-only
 	 * @throws IOException thrown if an IO error occurs.
 	 */
-	public synchronized void setSize(int size, boolean preserveData) throws IOException {
+	public void setSize(int size, boolean preserveData) throws IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -355,6 +361,10 @@ public class ChainedBuffer implements Buffer {
 		}
 		else {
 			shrink(size, preserveData);
+		}
+		}
+		finally {
+			rwLock.writeLock().unlock();
 		}
 	}
 
@@ -597,7 +607,9 @@ public class ChainedBuffer implements Buffer {
 	 * @throws IndexOutOfBoundsException if offset is invalid.
 	 * @throws IOException thrown if an IO error occurs
 	 */
-	public synchronized ChainedBuffer split(int offset) throws IndexOutOfBoundsException, IOException {
+	public ChainedBuffer split(int offset) throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -654,6 +666,10 @@ public class ChainedBuffer implements Buffer {
 		shrink(offset, true);
 
 		return newDBBuf;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/**
@@ -665,7 +681,9 @@ public class ChainedBuffer implements Buffer {
 	 * @throws UnsupportedOperationException if read-only, uninitialized data source is used,
 	 * or both buffers do not have the same obfuscation enablement
 	 */
-	public synchronized void append(ChainedBuffer dbBuf) throws IOException {
+	public void append(ChainedBuffer dbBuf) throws IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -729,6 +747,10 @@ public class ChainedBuffer implements Buffer {
 
 		dbBuf.dataBufferIdTable = null;
 		dbBuf.size = 0;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/**
@@ -860,7 +882,9 @@ public class ChainedBuffer implements Buffer {
 	 * Delete and release all underlying DataBuffers. 
 	 * @throws IOException thrown if an IO error occurs
 	 */
-	public synchronized void delete() throws IOException {
+	public void delete() throws IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -885,6 +909,10 @@ public class ChainedBuffer implements Buffer {
 		indexBufferIdTable = null;
 		size = 0;
 		firstBufferId = -1;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/**
@@ -933,8 +961,10 @@ public class ChainedBuffer implements Buffer {
 	 * @see ghidra.framework.store.Buffer#get(int, byte[], int, int)
 	 */
 	@Override
-	public synchronized void get(int offset, byte[] data, int dataOffset, int length)
+	public void get(int offset, byte[] data, int dataOffset, int length)
 			throws IndexOutOfBoundsException, IOException {
+		rwLock.readLock().lock();
+		try {
 		if (dataBufferIdTable == null) {
 			throw new AssertException("Invalid Buffer");
 		}
@@ -954,31 +984,49 @@ public class ChainedBuffer implements Buffer {
 			len -= n;
 			bufferDataOffset = 0;
 		}
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#get(int, byte[])
 	 */
 	@Override
-	public synchronized void get(int offset, byte[] data) throws IndexOutOfBoundsException, IOException {
+	public void get(int offset, byte[] data) throws IndexOutOfBoundsException, IOException {
+		rwLock.readLock().lock();
+		try {
 		get(offset, data, 0, data.length);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#get(int, int)
 	 */
 	@Override
-	public synchronized byte[] get(int offset, int length) throws IndexOutOfBoundsException, IOException {
+	public byte[] get(int offset, int length) throws IndexOutOfBoundsException, IOException {
+		rwLock.readLock().lock();
+		try {
 		byte[] data = new byte[length];
 		get(offset, data, 0, length);
 		return data;
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#getByte(int)
 	 */
 	@Override
-	public synchronized byte getByte(int offset) throws IndexOutOfBoundsException, IOException {
+	public byte getByte(int offset) throws IndexOutOfBoundsException, IOException {
+		rwLock.readLock().lock();
+		try {
 		if (dataBufferIdTable == null) {
 			throw new AssertException("Invalid Buffer");
 		}
@@ -1001,13 +1049,19 @@ public class ChainedBuffer implements Buffer {
 			b = xorMaskByte(bufferDataOffset, b);
 		}
 		return b;
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#getInt(int)
 	 */
 	@Override
-	public synchronized int getInt(int offset) throws IndexOutOfBoundsException, IOException {
+	public int getInt(int offset) throws IndexOutOfBoundsException, IOException {
+		rwLock.readLock().lock();
+		try {
 		int bufferOffset = dataBaseOffset + (offset % dataSpace);
 		if (bufferOffset + 3 <= dataSpace) {
 			if (dataBufferIdTable == null) {
@@ -1035,13 +1089,19 @@ public class ChainedBuffer implements Buffer {
 		byte[] data = get(offset, 4);
 		return ((data[0] & 0xff) << 24) | ((data[1] & 0xff) << 16) | ((data[2] & 0xff) << 8) |
 			(data[3] & 0xff);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#getLong(int)
 	 */
 	@Override
-	public synchronized long getLong(int offset) throws IndexOutOfBoundsException, IOException {
+	public long getLong(int offset) throws IndexOutOfBoundsException, IOException {
+		rwLock.readLock().lock();
+		try {
 		int bufferOffset = dataBaseOffset + (offset % dataSpace);
 		if (bufferOffset + 7 <= dataSpace) {
 			if (dataBufferIdTable == null) {
@@ -1071,13 +1131,19 @@ public class ChainedBuffer implements Buffer {
 			(((long) data[2] & 0xff) << 40) | (((long) data[3] & 0xff) << 32) |
 			(((long) data[4] & 0xff) << 24) | (((long) data[5] & 0xff) << 16) |
 			(((long) data[6] & 0xff) << 8) | ((long) data[7] & 0xff);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#getShort(int)
 	 */
 	@Override
-	public synchronized short getShort(int offset) throws IndexOutOfBoundsException, IOException {
+	public short getShort(int offset) throws IndexOutOfBoundsException, IOException {
+		rwLock.readLock().lock();
+		try {
 		int bufferOffset = dataBaseOffset + (offset % dataSpace);
 		if (bufferOffset + 1 <= dataSpace) {
 			if (dataBufferIdTable == null) {
@@ -1104,6 +1170,10 @@ public class ChainedBuffer implements Buffer {
 		}
 		byte[] data = get(offset, 2);
 		return (short) (((data[0] & 0xff) << 8) | (data[1] & 0xff));
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/*
@@ -1123,8 +1193,10 @@ public class ChainedBuffer implements Buffer {
 	 * or the end of buffer was encountered while storing the data.
 	 * @throws IOException thrown if an IO error occurs
 	 */
-	public synchronized void fill(int startOffset, int endOffset, byte fillByte)
+	public void fill(int startOffset, int endOffset, byte fillByte)
 			throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -1152,6 +1224,10 @@ public class ChainedBuffer implements Buffer {
 		}
 		finally {
 			xorData = null;
+		}
+		}
+		finally {
+			rwLock.writeLock().unlock();
 		}
 	}
 
@@ -1195,7 +1271,9 @@ public class ChainedBuffer implements Buffer {
 	 * @param in data source
 	 * @throws IOException thrown if IO error occurs.
 	 */
-	public synchronized void fill(InputStream in) throws IOException {
+	public void fill(InputStream in) throws IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -1234,14 +1312,20 @@ public class ChainedBuffer implements Buffer {
 		finally {
 			xorData = null;
 		}
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#put(int, byte[], int, int)
 	 */
 	@Override
-	public synchronized int put(int offset, byte[] data, int dataOffset, int length)
+	public int put(int offset, byte[] data, int dataOffset, int length)
 			throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
@@ -1271,21 +1355,33 @@ public class ChainedBuffer implements Buffer {
 		finally {
 			xorData = null;
 		}
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#put(int, byte[])
 	 */
 	@Override
-	public synchronized int put(int offset, byte[] bytes) throws IndexOutOfBoundsException, IOException {
+	public int put(int offset, byte[] bytes) throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 		return put(offset, bytes, 0, bytes.length);
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#putByte(int, byte)
 	 */
 	@Override
-	public synchronized int putByte(int offset, byte b) throws IndexOutOfBoundsException, IOException {
+	public int putByte(int offset, byte b) throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -1303,13 +1399,19 @@ public class ChainedBuffer implements Buffer {
 		buffer.putByte(dataBaseOffset + bufferDataOffset, b);
 		bufferMgr.releaseBuffer(buffer);
 		return offset + 1;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#putInt(int, int)
 	 */
 	@Override
-	public synchronized int putInt(int offset, int v) throws IndexOutOfBoundsException, IOException {
+	public int putInt(int offset, int v) throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -1337,13 +1439,19 @@ public class ChainedBuffer implements Buffer {
 			put(offset, data);
 		}
 		return offset + 4;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/*
 	 * @see ghidra.framework.store.Buffer#putLong(int, long)
 	 */
 	@Override
-	public synchronized int putLong(int offset, long v) throws IndexOutOfBoundsException, IOException {
+	public int putLong(int offset, long v) throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -1375,10 +1483,16 @@ public class ChainedBuffer implements Buffer {
 			put(offset, data);
 		}
 		return offset + 8;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	@Override
-	public synchronized int putShort(int offset, short v) throws IndexOutOfBoundsException, IOException {
+	public int putShort(int offset, short v) throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 		if (readOnly) {
 			throw new UnsupportedOperationException("Read-only buffer");
 		}
@@ -1404,6 +1518,10 @@ public class ChainedBuffer implements Buffer {
 			put(offset, data);
 		}
 		return offset + 2;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/**

@@ -28,6 +28,10 @@ import db.*;
  */
 public class FileBytes {
 
+	// reads share, modifications are exclusive (formerly every method was synchronized)
+	private final java.util.concurrent.locks.ReentrantReadWriteLock rwLock =
+		new java.util.concurrent.locks.ReentrantReadWriteLock();
+
 	final FileBytesAdapter adapter;
 
 	private final long id;
@@ -48,7 +52,9 @@ public class FileBytes {
 		refresh(record);
 	}
 
-	synchronized boolean refresh(DBRecord record) throws IOException {
+	boolean refresh(DBRecord record) throws IOException {
+		rwLock.writeLock().lock();
+		try {
 
 		String f = record.getString(FileBytesAdapter.FILENAME_COL);
 		long offset = record.getLongValue(FileBytesAdapter.OFFSET_COL);
@@ -72,6 +78,10 @@ public class FileBytes {
 			layeredBuffers[i] = adapter.getBuffer(bufferIds[i], originalBuffers[i]);
 		}
 		return true;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	long getId() {
@@ -112,9 +122,15 @@ public class FileBytes {
 	 * @throws IOException if there is a problem reading the database.
 	 * @throws IndexOutOfBoundsException if the given offset is invalid.
 	 */
-	public synchronized byte getModifiedByte(long offset)
+	public byte getModifiedByte(long offset)
 			throws IOException, IndexOutOfBoundsException {
+		rwLock.readLock().lock();
+		try {
 		return getByte(layeredBuffers, offset);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/**
@@ -124,9 +140,15 @@ public class FileBytes {
 	 * @throws IOException if there is a problem reading the database.
 	 * @throws IndexOutOfBoundsException if the given offset is invalid.
 	 */
-	public synchronized byte getOriginalByte(long offset)
+	public byte getOriginalByte(long offset)
 			throws IOException, IndexOutOfBoundsException {
+		rwLock.readLock().lock();
+		try {
 		return getByte(originalBuffers, offset);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/**
@@ -139,9 +161,15 @@ public class FileBytes {
 	 * @throws IOException if there is an error reading from the database
 	 * @throws IndexOutOfBoundsException if the given offset is invalid.
 	 */
-	public synchronized int getModifiedBytes(long offset, byte[] b)
+	public int getModifiedBytes(long offset, byte[] b)
 			throws IOException, IndexOutOfBoundsException {
+		rwLock.readLock().lock();
+		try {
 		return getBytes(layeredBuffers, offset, b, 0, b.length);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/**
@@ -154,9 +182,15 @@ public class FileBytes {
 	 * @throws IOException if there is an error reading from the database
 	 * @throws IndexOutOfBoundsException if the given offset is invalid.
 	 */
-	public synchronized int getOriginalBytes(long offset, byte[] b)
+	public int getOriginalBytes(long offset, byte[] b)
 			throws IOException, IndexOutOfBoundsException {
+		rwLock.readLock().lock();
+		try {
 		return getBytes(originalBuffers, offset, b, 0, b.length);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/**
@@ -173,9 +207,15 @@ public class FileBytes {
 	 * @throws IndexOutOfBoundsException if the destination offset and length would exceed the
 	 * size of the buffer b.
 	 */
-	public synchronized int getModifiedBytes(long offset, byte[] b, int off, int length)
+	public int getModifiedBytes(long offset, byte[] b, int off, int length)
 			throws IOException, IndexOutOfBoundsException {
+		rwLock.readLock().lock();
+		try {
 		return getBytes(layeredBuffers, offset, b, off, length);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	/**
@@ -192,9 +232,15 @@ public class FileBytes {
 	 * @throws IndexOutOfBoundsException if the destination offset and length would exceed the
 	 * size of the buffer b.
 	 */
-	public synchronized int getOriginalBytes(long offset, byte[] b, int off, int length)
+	public int getOriginalBytes(long offset, byte[] b, int off, int length)
 			throws IOException, IndexOutOfBoundsException {
+		rwLock.readLock().lock();
+		try {
 		return getBytes(originalBuffers, offset, b, off, length);
+		}
+		finally {
+			rwLock.readLock().unlock();
+		}
 	}
 
 	void checkValid() {
@@ -203,8 +249,14 @@ public class FileBytes {
 		}
 	}
 
-	synchronized void invalidate() {
+	void invalidate() {
+		rwLock.writeLock().lock();
+		try {
 		invalid = true;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/**
@@ -217,7 +269,9 @@ public class FileBytes {
 	 * @throws IndexOutOfBoundsException if invalid offset is specified
 	 * @throws IOException if the write to the database fails.
 	 */
-	synchronized void putByte(long offset, byte b) throws IndexOutOfBoundsException, IOException {
+	void putByte(long offset, byte b) throws IndexOutOfBoundsException, IOException {
+		rwLock.writeLock().lock();
+		try {
 
 		checkValid();
 
@@ -233,6 +287,10 @@ public class FileBytes {
 		int dbBufferIndex = (int) (offset / maxBufferSize);
 		int localOffset = (int) (offset % maxBufferSize);
 		layeredBuffers[dbBufferIndex].putByte(localOffset, b);
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/**
@@ -246,8 +304,14 @@ public class FileBytes {
 	 * @throws IndexOutOfBoundsException if invalid offset is specified
 	 * @throws IOException if the write to the database fails.
 	 */
-	synchronized int putBytes(long offset, byte[] b) throws IOException, IndexOutOfBoundsException {
+	int putBytes(long offset, byte[] b) throws IOException, IndexOutOfBoundsException {
+		rwLock.writeLock().lock();
+		try {
 		return putBytes(offset, b, 0, b.length);
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	/**
@@ -263,8 +327,10 @@ public class FileBytes {
 	 * @throws IndexOutOfBoundsException if invalid offset is specified
 	 * @throws IOException if the write to the database fails.
 	 */
-	synchronized int putBytes(long offset, byte[] b, int off, int length)
+	int putBytes(long offset, byte[] b, int off, int length)
 			throws IOException, IndexOutOfBoundsException {
+		rwLock.writeLock().lock();
+		try {
 
 		checkValid();
 
@@ -302,6 +368,10 @@ public class FileBytes {
 			byteArrayOffset += writeLen;
 		}
 		return length;
+		}
+		finally {
+			rwLock.writeLock().unlock();
+		}
 	}
 
 	private byte getByte(DBBuffer[] buffers, long offset)

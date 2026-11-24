@@ -18,6 +18,7 @@ package db;
 import java.io.File;
 import java.io.IOException;
 import java.util.Hashtable;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import db.buffers.*;
 import db.util.ErrorHandler;
@@ -281,7 +282,7 @@ public class DBHandle {
 	public boolean takeRecoverySnapshot(DBChangeSet changeSet, TaskMonitor monitor)
 			throws CancelledException, IOException {
 		long cpNum;
-		synchronized (this) {
+		try (LockScope dbLock1 = lockWrite()) {
 			if (!bufferMgr.modifiedSinceSnapshot()) {
 				return true;
 			}
@@ -296,7 +297,7 @@ public class DBHandle {
 		if (!bufferMgr.takeRecoverySnapshot(changeSet, monitor)) {
 			return false;
 		}
-		synchronized (this) {
+		try (LockScope dbLock2 = lockWrite()) {
 			lastRecoverySnapshotId = cpNum;
 		}
 		return true;
@@ -377,6 +378,74 @@ public class DBHandle {
 	/**
 	 * @return the buffer manager
 	 */
+	// ---- Database access lock -------------------------------------------------------------
+	// Formerly every Table/DBBuffer operation synchronized on this handle, which serialized all
+	// database reads in a program behind a single monitor. Read-only operations now share a
+	// read lock (BufferMgr pins clean buffers for concurrent readers and each reading thread
+	// walks B-tree nodes with its own NodeMgr); anything that modifies the database or the
+	// buffer manager takes the write lock, exactly as exclusive as the old monitor.
+
+	/** A held database lock, released by {@link #close()}. */
+	public interface LockScope extends AutoCloseable {
+		@Override
+		void close();
+	}
+
+	private final ReentrantReadWriteLock dbLock = new ReentrantReadWriteLock();
+	private final LockScope writeUnlock = () -> dbLock.writeLock().unlock();
+
+	/**
+	 * Acquire exclusive access to the database. Re-entrant. Must not be called while the
+	 * current thread holds only shared access (a lock cannot be upgraded).
+	 * @return scope that releases the lock
+	 */
+	public LockScope lockWrite() {
+		if (!dbLock.isWriteLockedByCurrentThread() && dbLock.getReadHoldCount() > 0) {
+			throw new IllegalStateException(
+				"Database write access requested while holding shared read access");
+		}
+		dbLock.writeLock().lock();
+		if (dbLock.getWriteHoldCount() == 1 && bufferMgr != null) {
+			try {
+				bufferMgr.releaseSharedPins(); // readers' idle pins must go before any change
+			}
+			catch (IOException e) {
+				dbLock.writeLock().unlock();
+				throw new RuntimeException(e);
+			}
+		}
+		return writeUnlock;
+	}
+
+	/**
+	 * Acquire shared access for a read-only operation. A thread that already holds exclusive
+	 * access keeps it (and its exclusive buffer semantics).
+	 * @return scope that releases the lock
+	 */
+	public LockScope lockRead() {
+		if (dbLock.isWriteLockedByCurrentThread()) {
+			dbLock.writeLock().lock();
+			return writeUnlock;
+		}
+		dbLock.readLock().lock();
+		BufferMgr bm = bufferMgr;
+		if (bm == null) {
+			return () -> dbLock.readLock().unlock();
+		}
+		bm.enterSharedRead();
+		return () -> {
+			bm.exitSharedRead();
+			dbLock.readLock().unlock();
+		};
+	}
+
+	/**
+	 * @return true if the current thread holds shared (not exclusive) database access
+	 */
+	boolean isSharedReader() {
+		return !dbLock.isWriteLockedByCurrentThread() && dbLock.getReadHoldCount() > 0;
+	}
+
 	BufferMgr getBufferMgr() {
 		return bufferMgr;
 	}
@@ -464,7 +533,8 @@ public class DBHandle {
 	 * Start a new transaction
 	 * @return transaction ID
 	 */
-	public synchronized long startTransaction() {
+	public long startTransaction() {
+		try (LockScope dbLock3 = lockWrite()) {
 		if (isClosed()) {
 			throw new IllegalStateException("Database is closed");
 		}
@@ -475,6 +545,7 @@ public class DBHandle {
 		txStarted = true;
 		txStartingModCount = getModCount();
 		return ++lastTransactionID;
+		}
 	}
 
 	/**
@@ -509,8 +580,9 @@ public class DBHandle {
 	 * terminated and database rollback was performed (i.e., undo performed).
 	 * @throws IOException if IO error occurs
 	 */
-	private synchronized boolean doEndTransaction(long id, boolean commit)
+	private boolean doEndTransaction(long id, boolean commit)
 			throws DBRollbackException, IOException {
+		try (LockScope dbLock4 = lockWrite()) {
 		if (!txStarted || id != lastTransactionID) {
 			throw new IllegalStateException("Transaction id is not active");
 		}
@@ -536,6 +608,7 @@ public class DBHandle {
 			txStarted = false;
 		}
 		return false;
+		}
 	}
 
 	private void cacheChangedState() {
@@ -549,19 +622,23 @@ public class DBHandle {
 	 * 
 	 * @return current modification count
 	 */
-	public synchronized long getModCount() {
+	public long getModCount() {
+		try (LockScope dbLock5 = lockRead()) {
 		if (bufferMgr == null) {
 			return txStartingModCount; // ballpark value (database has been closed)
 		}
 		return bufferMgr.getModCount();
+		}
 	}
 
 	/**
 	 * Returns true if there are uncommitted changes to the database.
 	 * @return  true if there are uncommitted changes to the database.
 	 */
-	public synchronized boolean hasUncommittedChanges() {
+	public boolean hasUncommittedChanges() {
+		try (LockScope dbLock6 = lockRead()) {
 		return (bufferMgr != null && !bufferMgr.atCheckpoint());
+		}
 	}
 
 	/**
@@ -579,7 +656,7 @@ public class DBHandle {
 			throw new IllegalArgumentException(
 				"Requires local versioned buffer file opened for versioning update");
 		}
-		synchronized (this) {
+		try (LockScope dbLock7 = lockWrite()) {
 			if (isTransactionActive()) {
 				throw new IOException("transaction is active");
 			}
@@ -607,7 +684,7 @@ public class DBHandle {
 	 */
 	public void terminateTransaction(long id, boolean commit) throws IOException {
 		boolean rollback = false;
-		synchronized (this) {
+		try (LockScope dbLock8 = lockWrite()) {
 			try {
 				doEndTransaction(id, commit);
 			}
@@ -638,7 +715,7 @@ public class DBHandle {
 	 */
 	public boolean undo() throws IOException {
 		boolean success = false;
-		synchronized (this) {
+		try (LockScope dbLock9 = lockWrite()) {
 			if (canUndo() && bufferMgr.undo(true)) {
 				++checkpointNum;
 				reloadTables();
@@ -684,7 +761,7 @@ public class DBHandle {
 	 */
 	public boolean redo() throws IOException {
 		boolean success = false;
-		synchronized (this) {
+		try (LockScope dbLock10 = lockWrite()) {
 			if (canRedo() && bufferMgr.redo()) {
 				++checkpointNum;
 				reloadTables();
@@ -704,9 +781,11 @@ public class DBHandle {
 	 * @param maxUndos maximum number of undo checkpoints.  An illegal 
 	 * value restores the default value.
 	 */
-	public synchronized void setMaxUndos(int maxUndos) {
+	public void setMaxUndos(int maxUndos) {
+		try (LockScope dbLock11 = lockWrite()) {
 		bufferMgr.setMaxUndos(maxUndos);
 		cacheChangedState();
+		}
 	}
 
 	/**
@@ -730,11 +809,12 @@ public class DBHandle {
 	 * @param keepRecoveryData true if existing recovery data should be retained or false to remove
 	 * any recovery data
 	 */
-	public synchronized void close(boolean keepRecoveryData) {
+	public void close(boolean keepRecoveryData) {
+		try (LockScope dbLock12 = lockWrite()) {
 
 		closeScratchPad();
 
-		synchronized (this) {
+		try (LockScope dbLock13 = lockWrite()) {
 			if (bufferMgr == null) {
 				return;
 			}
@@ -744,6 +824,7 @@ public class DBHandle {
 		}
 
 		notifyDbClosed();
+		}
 	}
 
 	/**
@@ -755,11 +836,13 @@ public class DBHandle {
 	 * 
 	 * @return true if unsaved changes have been made.
 	 */
-	public synchronized boolean isChanged() {
+	public boolean isChanged() {
+		try (LockScope dbLock14 = lockRead()) {
 		if (bufferMgr != null && txStarted) {
 			return cachedChangedState || txStartingModCount != getModCount();
 		}
 		return cachedChangedState;
+		}
 	}
 
 	/**
@@ -779,8 +862,9 @@ public class DBHandle {
 	 * @throws CancelledException if task monitor cancelled operation.
 	 * @throws IOException thrown if an IO error occurs.
 	 */
-	public synchronized void save(String comment, DBChangeSet changeSet, TaskMonitor monitor)
+	public void save(String comment, DBChangeSet changeSet, TaskMonitor monitor)
 			throws IOException, CancelledException {
+		try (LockScope dbLock15 = lockWrite()) {
 
 //TODO: Does not throw ReadOnlyException - should it?
 
@@ -804,6 +888,7 @@ public class DBHandle {
 		finally {
 			cacheChangedState();
 		}
+		}
 	}
 
 	/**
@@ -817,8 +902,9 @@ public class DBHandle {
 	 * @throws IOException if IO error occurs
 	 * @throws CancelledException if monitor cancels operation
 	 */
-	public synchronized void saveAs(BufferFile outFile, boolean associateWithNewFile,
+	public void saveAs(BufferFile outFile, boolean associateWithNewFile,
 			TaskMonitor monitor) throws IOException, CancelledException {
+		try (LockScope dbLock16 = lockWrite()) {
 
 		checkIsClosed();
 
@@ -851,6 +937,7 @@ public class DBHandle {
 		finally {
 			cacheChangedState();
 		}
+		}
 	}
 
 	/**
@@ -869,9 +956,10 @@ public class DBHandle {
 	 * @throws IOException if IO error occurs
 	 * @throws CancelledException if monitor cancels operation
 	 */
-	protected synchronized void saveAs(BufferFile outFile, Long newDatabaseId,
+	protected void saveAs(BufferFile outFile, Long newDatabaseId,
 			boolean associateWithNewFile, TaskMonitor monitor)
 			throws IOException, CancelledException {
+		try (LockScope dbLock17 = lockWrite()) {
 
 		checkIsClosed();
 
@@ -899,6 +987,7 @@ public class DBHandle {
 		finally {
 			cacheChangedState();
 		}
+		}
 	}
 
 	/**
@@ -913,8 +1002,9 @@ public class DBHandle {
 	 * @throws IOException if IO error occurs
 	 * @throws CancelledException if monitor cancels operation
 	 */
-	public synchronized void saveAs(File file, boolean associateWithNewFile, TaskMonitor monitor)
+	public void saveAs(File file, boolean associateWithNewFile, TaskMonitor monitor)
 			throws IOException, CancelledException {
+		try (LockScope dbLock18 = lockWrite()) {
 
 		checkIsClosed();
 
@@ -941,6 +1031,7 @@ public class DBHandle {
 		finally {
 			cacheChangedState();
 		}
+		}
 	}
 
 	/**
@@ -952,9 +1043,11 @@ public class DBHandle {
 	 * @return Buffer the newly created buffer
 	 * @throws IOException if an I/O error occurs while creating the buffer.
 	 */
-	public synchronized DBBuffer createBuffer(int length) throws IOException {
+	public DBBuffer createBuffer(int length) throws IOException {
+		try (LockScope dbLock19 = lockWrite()) {
 		checkTransaction();
 		return new DBBuffer(this, new ChainedBuffer(length, true, bufferMgr));
+		}
 	}
 
 	/**
@@ -967,10 +1060,12 @@ public class DBHandle {
 	 * @return Buffer the newly created buffer
 	 * @throws IOException if an I/O error occurs while creating the buffer.
 	 */
-	public synchronized DBBuffer createBuffer(DBBuffer shadowBuffer) throws IOException {
+	public DBBuffer createBuffer(DBBuffer shadowBuffer) throws IOException {
+		try (LockScope dbLock20 = lockWrite()) {
 		checkTransaction();
 		return new DBBuffer(this,
 			new ChainedBuffer(shadowBuffer.length(), true, shadowBuffer.buf, 0, bufferMgr));
+		}
 	}
 
 	/**
@@ -981,9 +1076,11 @@ public class DBHandle {
 	 * @return Buffer the buffer associated with the given id.
 	 * @throws IOException if an I/O error occurs while getting the buffer.
 	 */
-	public synchronized DBBuffer getBuffer(int id) throws IOException {
+	public DBBuffer getBuffer(int id) throws IOException {
+		try (LockScope dbLock21 = lockWrite()) {
 		checkIsClosed();
 		return new DBBuffer(this, new ChainedBuffer(bufferMgr, id));
+		}
 	}
 
 	/**
@@ -997,9 +1094,11 @@ public class DBHandle {
 	 * @return Buffer the buffer associated with the given id.
 	 * @throws IOException if an I/O error occurs while getting the buffer.
 	 */
-	public synchronized DBBuffer getBuffer(int id, DBBuffer shadowBuffer) throws IOException {
+	public DBBuffer getBuffer(int id, DBBuffer shadowBuffer) throws IOException {
+		try (LockScope dbLock22 = lockWrite()) {
 		checkIsClosed();
 		return new DBBuffer(this, new ChainedBuffer(bufferMgr, id, shadowBuffer.buf, 0));
+		}
 	}
 
 	/**
@@ -1122,7 +1221,7 @@ public class DBHandle {
 	 */
 	public Table createTable(String name, Schema schema, int[] indexedColumns) throws IOException {
 		Table table;
-		synchronized (this) {
+		try (LockScope dbLock23 = lockWrite()) {
 			if (tables.containsKey(name)) {
 				throw new IOException("Table already exists: " + name);
 			}
@@ -1146,8 +1245,9 @@ public class DBHandle {
 	 * @throws DuplicateNameException if a table with the new name already exists
 	 * @return true if the name was changed successfully
 	 */
-	public synchronized boolean setTableName(String oldName, String newName)
+	public boolean setTableName(String oldName, String newName)
 			throws DuplicateNameException {
+		try (LockScope dbLock24 = lockWrite()) {
 		if (!tables.containsKey(oldName)) {
 			return false;
 		}
@@ -1162,6 +1262,7 @@ public class DBHandle {
 		masterTable.changeTableName(oldName, newName);
 		tables.put(newName, table);
 		return true;
+		}
 	}
 
 	/**
@@ -1171,7 +1272,7 @@ public class DBHandle {
 	 */
 	public void deleteTable(String name) throws IOException {
 		Table table;
-		synchronized (this) {
+		try (LockScope dbLock25 = lockWrite()) {
 			table = tables.get(name);
 			if (table == null) {
 				return;

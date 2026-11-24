@@ -43,6 +43,26 @@ public class DbCache<T extends DbObject> {
 	protected WeakReferenceCache<Long, T> refCache;
 	private volatile int modificationCount;
 
+	// Instantiation only has to be exclusive per key (so two threads never create two objects
+	// for the same record); it used to hold the cache-wide monitor across the database read,
+	// which serialized every cache miss in the program behind one lock. Stripe it by key.
+	private static final int STRIPES = 64;
+	private final Object[] stripes = newStripes();
+
+	private static Object[] newStripes() {
+		Object[] s = new Object[STRIPES];
+		for (int i = 0; i < STRIPES; i++) {
+			s[i] = new Object();
+		}
+		return s;
+	}
+
+	private Object stripeFor(long key) {
+		long h = key ^ (key >>> 32);
+		h ^= (h >>> 16);
+		return stripes[(int) (h & (STRIPES - 1))];
+	}
+
 	/**
 	 * Constructor
 	 * @param factory the factory for creating new instances of database objects
@@ -244,29 +264,33 @@ public class DbCache<T extends DbObject> {
 		return modificationCount;
 	}
 
-	private synchronized T instantiateAndCacheSafely(Long key) {
-		// check if another thread got here first
-		T t = refCache.get(key);
-		if (t != null && t.refreshIfNeeded()) {
+	private T instantiateAndCacheSafely(Long key) {
+		synchronized (stripeFor(key)) {
+			// check if another thread got here first
+			T t = refCache.get(key);
+			if (t != null && t.refreshIfNeeded()) {
+				return t;
+			}
+
+			t = factory.instantiate(key);
+			if (t != null) {
+				add(t);
+			}
 			return t;
 		}
-
-		t = factory.instantiate(key);
-		if (t != null) {
-			add(t);
-		}
-		return t;
 	}
 
-	private synchronized T instantiateAndCacheSafely(DBRecord record) {
-		// check if another thread got here first
-		T t = refCache.get(record.getKey());
-		if (t != null && t.refreshIfNeeded()) {
+	private T instantiateAndCacheSafely(DBRecord record) {
+		synchronized (stripeFor(record.getKey())) {
+			// check if another thread got here first
+			T t = refCache.get(record.getKey());
+			if (t != null && t.refreshIfNeeded()) {
+				return t;
+			}
+			t = factory.instantiate(record);
+			add(t);
 			return t;
 		}
-		t = factory.instantiate(record);
-		add(t);
-		return t;
 	}
 
 	/**

@@ -39,6 +39,26 @@ public class Table {
 
 	private NodeMgr nodeMgr;
 
+	// Shared readers each walk the B-tree with their own NodeMgr (see DBHandle.lockRead)
+	private final ThreadLocal<NodeMgr> readerNodeMgr = new ThreadLocal<>();
+
+	/**
+	 * @return the node manager for the current operation: the table's own for exclusive access,
+	 * a per-thread one for shared readers, or null if the table is invalid
+	 */
+	private NodeMgr nm() {
+		NodeMgr shared = nodeMgr;
+		if (shared == null || !db.isSharedReader()) {
+			return shared;
+		}
+		NodeMgr m = readerNodeMgr.get();
+		if (m == null || m.getBufferMgr() != shared.getBufferMgr()) {
+			m = new NodeMgr(this, shared.getBufferMgr());
+			readerNodeMgr.set(m);
+		}
+		return m;
+	}
+
 	private int rootBufferId = -1;
 	private int recordCount;
 	private long maximumKey;
@@ -147,12 +167,12 @@ public class Table {
 
 	private BTreeNode getBTreeNode(int bufferId) throws IOException {
 		if (schema.useLongKeyNodes()) {
-			return nodeMgr.getLongKeyNode(bufferId);
+			return nm().getLongKeyNode(bufferId);
 		}
 		if (schema.useFixedKeyNodes()) {
-			return nodeMgr.getFixedKeyNode(bufferId);
+			return nm().getFixedKeyNode(bufferId);
 		}
-		return nodeMgr.getVarKeyNode(bufferId);
+		return nm().getVarKeyNode(bufferId);
 	}
 
 	/**
@@ -163,9 +183,9 @@ public class Table {
 	 */
 	private FieldKeyNode getFieldKeyNode(int bufferId) throws IOException {
 		if (schema.useFixedKeyNodes()) {
-			return nodeMgr.getFixedKeyNode(bufferId);
+			return nm().getFixedKeyNode(bufferId);
 		}
-		return nodeMgr.getVarKeyNode(bufferId);
+		return nm().getVarKeyNode(bufferId);
 	}
 
 	/**
@@ -192,13 +212,13 @@ public class Table {
 		else {
 			++stats.recordNodeCnt;
 			for (int id : ids) {
-				ChainedBuffer dbBuf = new ChainedBuffer(nodeMgr.getBufferMgr(), id);
+				ChainedBuffer dbBuf = new ChainedBuffer(nm().getBufferMgr(), id);
 				int cnt = dbBuf.getBufferCount();
 				stats.chainedBufferCnt += cnt;
 				stats.bufferCount += cnt;
 			}
 		}
-		nodeMgr.releaseNodes(); // no need to hang on to buffers
+		nm().releaseNodes(); // no need to hang on to buffers
 	}
 
 	/**
@@ -207,15 +227,15 @@ public class Table {
 	 * @throws IOException thrown if an IO error occurs
 	 */
 	public TableStatistics getStatistics() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 			TableStatistics stats = new TableStatistics();
 			stats.name = getName();
 			try {
 				accumulateNodeStatistics(stats, rootBufferId);
-				stats.size = stats.bufferCount * nodeMgr.getBufferMgr().getBufferSize();
+				stats.size = stats.bufferCount * nm().getBufferMgr().getBufferSize();
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 			return stats;
 		}
@@ -292,7 +312,7 @@ public class Table {
 	 * @throws CancelledException if task was cancelled
 	 */
 	public void rebuild(TaskMonitor monitor) throws IOException, CancelledException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 
 			db.checkTransaction();
 
@@ -312,7 +332,7 @@ public class Table {
 					"): failed to fetch root buffer: " + t.getMessage());
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 
 			// Rebuild table indexes
@@ -326,7 +346,7 @@ public class Table {
 				}
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 
 			// Determine actual record count, max-key value and rebuild indexes
@@ -347,7 +367,7 @@ public class Table {
 				}
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 
 			if (maxKey != null && maxKey.getLongValue() > tableRecord.getMaxKey()) {
@@ -375,7 +395,7 @@ public class Table {
 
 	boolean isConsistent(String indexName, TaskMonitor monitor)
 			throws IOException, CancelledException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 
 			if (rootBufferId < 0) {
 				return true;
@@ -394,7 +414,7 @@ public class Table {
 				return false;
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 
 			// Check consistency of index tables
@@ -498,7 +518,7 @@ public class Table {
 	 * @throws IOException if IO error occurs
 	 */
 	public void deleteAll() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 			db.checkTransaction();
 			if (rootBufferId < 0) {
 				return;
@@ -522,7 +542,7 @@ public class Table {
 				}
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 
 		}
@@ -643,17 +663,17 @@ public class Table {
 	 * @throws IOException thrown if IO error occurs
 	 */
 	public boolean hasRecord(long key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return false;
 			}
 			boolean result = false;
 			try {
-				LongKeyRecordNode leaf = nodeMgr.getLongKeyNode(rootBufferId).getLeafNode(key);
+				LongKeyRecordNode leaf = nm().getLongKeyNode(rootBufferId).getLeafNode(key);
 				result = leaf.getKeyIndex(key) >= 0;
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 			return result;
 		}
@@ -666,7 +686,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public boolean hasRecord(Field key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (schema.useLongKeyNodes()) {
 				return hasRecord(key.getLongValue());
 			}
@@ -679,7 +699,7 @@ public class Table {
 				result = leaf.getKeyIndex(key) >= 0;
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 			return result;
 		}
@@ -693,16 +713,16 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecord(long key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
 			try {
-				LongKeyRecordNode leaf = nodeMgr.getLongKeyNode(rootBufferId).getLeafNode(key);
+				LongKeyRecordNode leaf = nm().getLongKeyNode(rootBufferId).getLeafNode(key);
 				return leaf.getRecord(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -715,7 +735,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecord(Field key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
@@ -725,14 +745,14 @@ public class Table {
 			FieldKeyRecordNode leaf;
 			try {
 				if (key instanceof FixedField) {
-					leaf = nodeMgr.getFixedKeyNode(rootBufferId).getLeafNode(key);
+					leaf = nm().getFixedKeyNode(rootBufferId).getLeafNode(key);
 					return leaf.getRecord(key, schema);
 				}
 				leaf = getFieldKeyNode(rootBufferId).getLeafNode(key);
 				return leaf.getRecord(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -746,16 +766,16 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecordBefore(long key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
 			try {
-				LongKeyRecordNode leaf = nodeMgr.getLongKeyNode(rootBufferId).getLeafNode(key);
+				LongKeyRecordNode leaf = nm().getLongKeyNode(rootBufferId).getLeafNode(key);
 				return leaf.getRecordBefore(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -769,7 +789,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecordBefore(Field key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
@@ -781,7 +801,7 @@ public class Table {
 				return leaf.getRecordBefore(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -795,16 +815,16 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecordAfter(long key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
 			try {
-				LongKeyRecordNode leaf = nodeMgr.getLongKeyNode(rootBufferId).getLeafNode(key);
+				LongKeyRecordNode leaf = nm().getLongKeyNode(rootBufferId).getLeafNode(key);
 				return leaf.getRecordAfter(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -818,7 +838,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecordAfter(Field key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
@@ -830,7 +850,7 @@ public class Table {
 				return leaf.getRecordAfter(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -844,16 +864,16 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecordAtOrBefore(long key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
 			try {
-				LongKeyRecordNode leaf = nodeMgr.getLongKeyNode(rootBufferId).getLeafNode(key);
+				LongKeyRecordNode leaf = nm().getLongKeyNode(rootBufferId).getLeafNode(key);
 				return leaf.getRecordAtOrBefore(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -867,7 +887,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecordAtOrBefore(Field key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
@@ -879,7 +899,7 @@ public class Table {
 				return leaf.getRecordAtOrBefore(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -893,16 +913,16 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecordAtOrAfter(long key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
 			try {
-				LongKeyRecordNode leaf = nodeMgr.getLongKeyNode(rootBufferId).getLeafNode(key);
+				LongKeyRecordNode leaf = nm().getLongKeyNode(rootBufferId).getLeafNode(key);
 				return leaf.getRecordAtOrAfter(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -916,7 +936,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public DBRecord getRecordAtOrAfter(Field key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (rootBufferId < 0) {
 				return null;
 			}
@@ -928,7 +948,7 @@ public class Table {
 				return leaf.getRecordAtOrAfter(key, schema);
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 	}
@@ -939,7 +959,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public void putRecord(DBRecord record) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 			db.checkTransaction();
 			if (schema.useLongKeyNodes()) {
 				putLongKeyRecord(record);
@@ -970,7 +990,7 @@ public class Table {
 				rootNode = LongKeyRecordNode.createRecordNode(nodeMgr, schema);
 			}
 			else {
-				rootNode = nodeMgr.getLongKeyNode(rootBufferId);
+				rootNode = nm().getLongKeyNode(rootBufferId);
 			}
 
 			// Put record and update root buffer ID
@@ -991,7 +1011,7 @@ public class Table {
 		}
 		finally {
 			// Release node buffers and update record count
-			int delta = nodeMgr.releaseNodes();
+			int delta = nm().releaseNodes();
 			if (delta != 0) {
 //				inserted = true;
 				recordCount += delta;
@@ -1016,7 +1036,7 @@ public class Table {
 			++modCount;
 			FieldKeyNode rootNode = null;
 			if (rootBufferId < 0) {
-				rootNode = schema.useFixedKeyNodes() ? FixedKeyRecordNode.createRecordNode(nodeMgr)
+				rootNode = schema.useFixedKeyNodes() ? FixedKeyRecordNode.createRecordNode(nm())
 						: new VarKeyRecordNode(nodeMgr, schema.getKeyFieldType());
 			}
 			else {
@@ -1038,7 +1058,7 @@ public class Table {
 		}
 		finally {
 			// Release node buffers and update record count
-			int delta = nodeMgr.releaseNodes();
+			int delta = nm().releaseNodes();
 			if (delta != 0) {
 //				inserted = true;
 				recordCount += delta;
@@ -1054,7 +1074,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public boolean deleteRecord(long key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 			db.checkTransaction();
 			boolean result = false;
 
@@ -1066,7 +1086,7 @@ public class Table {
 			}
 			try {
 				++modCount;
-				LongKeyNode rootNode = nodeMgr.getLongKeyNode(rootBufferId);
+				LongKeyNode rootNode = nm().getLongKeyNode(rootBufferId);
 				LongKeyRecordNode leaf = rootNode.getLeafNode(key);
 				rootNode = leaf.deleteRecord(key, isIndexed ? this : null);
 
@@ -1085,7 +1105,7 @@ public class Table {
 			}
 			finally {
 				// Release node buffers and update record count
-				int delta = nodeMgr.releaseNodes();
+				int delta = nm().releaseNodes();
 				if (delta != 0) {
 					result = true;
 					recordCount += delta;
@@ -1103,7 +1123,7 @@ public class Table {
 	 * @throws IOException throw if an IO Error occurs
 	 */
 	public boolean deleteRecord(Field key) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 			db.checkTransaction();
 			boolean result = false;
 
@@ -1134,7 +1154,7 @@ public class Table {
 			}
 			finally {
 				// Release node buffers and update record count
-				int delta = nodeMgr.releaseNodes();
+				int delta = nm().releaseNodes();
 				if (delta != 0) {
 					result = true;
 					recordCount += delta;
@@ -1153,7 +1173,7 @@ public class Table {
 	 * @throws IOException thrown if an IO error occurs
 	 */
 	public boolean deleteRecords(long startKey, long endKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 			db.checkTransaction();
 			if (startKey > endKey) {
 				throw new IllegalArgumentException();
@@ -1169,7 +1189,7 @@ public class Table {
 
 			try {
 				++modCount;
-				LongKeyNode rootNode = nodeMgr.getLongKeyNode(rootBufferId);
+				LongKeyNode rootNode = nm().getLongKeyNode(rootBufferId);
 				LongKeyRecordNode leaf = rootNode.getLeafNode(startKey);
 
 				try {
@@ -1260,7 +1280,7 @@ public class Table {
 			}
 			finally {
 				// Release node buffers and update record count
-				int delta = nodeMgr.releaseNodes();
+				int delta = nm().releaseNodes();
 				if (delta != 0) {
 					result = true;
 					recordCount += delta;
@@ -1280,7 +1300,7 @@ public class Table {
 	 * @throws IOException thrown if an IO error occurs
 	 */
 	public boolean deleteRecords(Field startKey, Field endKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockWrite()) {
 			db.checkTransaction();
 			if (startKey.compareTo(endKey) > 0) {
 				throw new IllegalArgumentException();
@@ -1388,7 +1408,7 @@ public class Table {
 			}
 			finally {
 				// Release node buffers and update record count
-				int delta = nodeMgr.releaseNodes();
+				int delta = nm().releaseNodes();
 				if (delta != 0) {
 					result = true;
 					recordCount += delta;
@@ -1412,7 +1432,7 @@ public class Table {
 	 * column, or the wrong field type was specified, or an I/O error occurs.
 	 */
 	public Field[] findRecords(Field field, int columnIndex) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1432,7 +1452,7 @@ public class Table {
 	 * column, or the wrong field type was specified, or an I/O error occurs.
 	 */
 	public int getMatchingRecordCount(Field field, int columnIndex) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1451,7 +1471,7 @@ public class Table {
 	 * @throws IOException thrown if IO error occurs
 	 */
 	public boolean hasRecord(Field field, int columnIndex) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1469,7 +1489,7 @@ public class Table {
 	 * @throws IOException thrown if IO error occurs
 	 */
 	public DBFieldIterator indexFieldIterator(int columnIndex) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1491,7 +1511,7 @@ public class Table {
 	 */
 	public DBFieldIterator indexFieldIterator(Field minField, Field maxField, boolean before,
 			int columnIndex) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1516,7 +1536,7 @@ public class Table {
 	 */
 	public DBFieldIterator indexFieldIterator(Field minField, Field maxField, Field startField,
 			boolean before, int columnIndex) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1535,7 +1555,7 @@ public class Table {
 	 * column or an I/O error occurs.
 	 */
 	public RecordIterator indexIterator(int columnIndex) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1560,7 +1580,7 @@ public class Table {
 	 */
 	public RecordIterator indexIterator(int columnIndex, Field startValue, Field endValue,
 			boolean atStart) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1583,7 +1603,7 @@ public class Table {
 	 * column, or the wrong field type was specified, or an I/O error occurs.
 	 */
 	public RecordIterator indexIteratorAfter(int columnIndex, Field startValue) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1606,7 +1626,7 @@ public class Table {
 	 */
 	public RecordIterator indexIteratorBefore(int columnIndex, Field startValue)
 			throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1632,7 +1652,7 @@ public class Table {
 	 */
 	public RecordIterator indexIteratorAfter(int columnIndex, Field startValue, Field primaryKey)
 			throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1659,7 +1679,7 @@ public class Table {
 	 */
 	public RecordIterator indexIteratorBefore(int columnIndex, Field startValue, Field primaryKey)
 			throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1676,7 +1696,7 @@ public class Table {
 	 * @throws IOException thrown if IO error occurs
 	 */
 	public DBFieldIterator indexKeyIterator(int columnIndex) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1696,7 +1716,7 @@ public class Table {
 	 */
 	public DBFieldIterator indexKeyIteratorBefore(int columnIndex, Field startField)
 			throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1717,7 +1737,7 @@ public class Table {
 	 */
 	public DBFieldIterator indexKeyIteratorAfter(int columnIndex, Field startField)
 			throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1739,7 +1759,7 @@ public class Table {
 	 */
 	public DBFieldIterator indexKeyIteratorBefore(int columnIndex, Field startField,
 			Field primaryKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1761,7 +1781,7 @@ public class Table {
 	 */
 	public DBFieldIterator indexKeyIteratorAfter(int columnIndex, Field startField,
 			Field primaryKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1787,7 +1807,7 @@ public class Table {
 	 */
 	public DBFieldIterator indexKeyIterator(int columnIndex, Field minField, Field maxField,
 			boolean atMin) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1810,7 +1830,7 @@ public class Table {
 	 */
 	public DBFieldIterator indexKeyIterator(int columnIndex, Field minField, Field maxField,
 			Field startField, boolean before) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			IndexTable indexTable = secondaryIndexes.get(columnIndex);
 			if (indexTable == null) {
 				throw new IOException("Index required (" + getName() + "," + columnIndex + ")");
@@ -1825,7 +1845,7 @@ public class Table {
 	 * @throws IOException if an I/O error occurs.
 	 */
 	public RecordIterator iterator() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (schema.useLongKeyNodes()) {
 				return new LongKeyRecordIterator();
 			}
@@ -1841,7 +1861,7 @@ public class Table {
 	 * @throws IOException if an I/O error occurs.
 	 */
 	public RecordIterator iterator(long startKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (!schema.useLongKeyNodes()) {
 				throw new IllegalArgumentException("Field key required");
 			}
@@ -1861,7 +1881,7 @@ public class Table {
 	 * is less than minKey or greater than maxKey.
 	 */
 	public RecordIterator iterator(long minKey, long maxKey, long startKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (!schema.useLongKeyNodes()) {
 				throw new IllegalArgumentException("Field key required");
 			}
@@ -1877,7 +1897,7 @@ public class Table {
 	 * @throws IOException if an I/O error occurs.
 	 */
 	public RecordIterator iterator(Field startKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (schema.useLongKeyNodes()) {
 				return new LongKeyRecordIterator(Long.MIN_VALUE, Long.MAX_VALUE,
 					startKey.getLongValue());
@@ -1896,7 +1916,7 @@ public class Table {
 	 * @throws IOException if an I/O error occurs.
 	 */
 	public RecordIterator iterator(Field minKey, Field maxKey, Field startKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (schema.useLongKeyNodes()) {
 				long min = minKey != null ? minKey.getLongValue() : Long.MIN_VALUE;
 				long max = maxKey != null ? maxKey.getLongValue() : Long.MAX_VALUE;
@@ -1913,7 +1933,7 @@ public class Table {
 	 * @throws IOException if an I/O error occurs.
 	 */
 	public DBLongIterator longKeyIterator() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (!schema.useLongKeyNodes()) {
 				throw new AssertException();
 			}
@@ -1929,7 +1949,7 @@ public class Table {
 	 * @throws IOException if an I/O error occurs.
 	 */
 	public DBLongIterator longKeyIterator(long startKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (!schema.useLongKeyNodes()) {
 				throw new AssertException();
 			}
@@ -1948,7 +1968,7 @@ public class Table {
 	 */
 	public DBLongIterator longKeyIterator(long minKey, long maxKey, long startKey)
 			throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (!schema.useLongKeyNodes()) {
 				throw new AssertException();
 			}
@@ -1962,7 +1982,7 @@ public class Table {
 	 * @throws IOException if an I/O error occurs.
 	 */
 	public DBFieldIterator fieldKeyIterator() throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (schema.useLongKeyNodes()) {
 				throw new AssertException();
 			}
@@ -1978,7 +1998,7 @@ public class Table {
 	 * @throws IOException if an I/O error occurs.
 	 */
 	public DBFieldIterator fieldKeyIterator(Field startKey) throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (schema.useLongKeyNodes()) {
 				throw new AssertException();
 			}
@@ -1998,7 +2018,7 @@ public class Table {
 	 */
 	public DBFieldIterator fieldKeyIterator(Field minKey, Field maxKey, Field startKey)
 			throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (schema.useLongKeyNodes()) {
 				throw new AssertException();
 			}
@@ -2018,7 +2038,7 @@ public class Table {
 	 */
 	public DBFieldIterator fieldKeyIterator(Field minKey, Field maxKey, boolean before)
 			throws IOException {
-		synchronized (db) {
+		try (DBHandle.LockScope dbLock = db.lockRead()) {
 			if (schema.useLongKeyNodes()) {
 				throw new AssertException();
 			}
@@ -2080,7 +2100,7 @@ public class Table {
 			}
 
 			try {
-				LongKeyNode rootNode = nodeMgr.getLongKeyNode(rootBufferId);
+				LongKeyNode rootNode = nm().getLongKeyNode(rootBufferId);
 				LongKeyRecordNode leaf = rootNode.getLeafNode(startKey);
 				recordIndex = leaf.getKeyIndex(startKey);
 
@@ -2132,7 +2152,7 @@ public class Table {
 				}
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 
@@ -2160,7 +2180,7 @@ public class Table {
 			isPrev = false;
 
 			if (expectedModCount == modCount) {
-				leaf = (LongKeyRecordNode) nodeMgr.getLongKeyNode(bufferId);
+				leaf = (LongKeyRecordNode) nm().getLongKeyNode(bufferId);
 				if (recordIndex >= leaf.keyCount || leaf.getKey(recordIndex) != curKey) {
 					leaf = null; // something changed - key search required
 				}
@@ -2169,7 +2189,7 @@ public class Table {
 			if (leaf == null) {
 
 				// Something changed - try to relocate record using key
-				LongKeyNode rootNode = nodeMgr.getLongKeyNode(rootBufferId);
+				LongKeyNode rootNode = nm().getLongKeyNode(rootBufferId);
 				leaf = rootNode.getLeafNode(curKey);
 				int index = leaf.getKeyIndex(curKey);
 				if (index < 0) {
@@ -2202,9 +2222,9 @@ public class Table {
 
 		@Override
 		public boolean hasNext() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 
-				if (!hasNext && nodeMgr != null) {
+				if (!hasNext && nm() != null) {
 
 					try {
 						// Check for modification to storage of previous record
@@ -2240,7 +2260,7 @@ public class Table {
 						}
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 				return hasNext;
@@ -2249,9 +2269,9 @@ public class Table {
 
 		@Override
 		public boolean hasPrevious() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 
-				if (!hasPrev && nodeMgr != null) {
+				if (!hasPrev && nm() != null) {
 
 					try {
 						// Check for modification to storage of next record
@@ -2287,7 +2307,7 @@ public class Table {
 						}
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 				return hasPrev;
@@ -2455,7 +2475,7 @@ public class Table {
 
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 
@@ -2527,9 +2547,9 @@ public class Table {
 
 		@Override
 		public boolean hasNext() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 
-				if (!hasNext && nodeMgr != null) {
+				if (!hasNext && nm() != null) {
 
 					try {
 						// Check for modification to storage of previous record
@@ -2566,7 +2586,7 @@ public class Table {
 						}
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 				return hasNext;
@@ -2575,9 +2595,9 @@ public class Table {
 
 		@Override
 		public boolean hasPrevious() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 
-				if (!hasPrev && nodeMgr != null) {
+				if (!hasPrev && nm() != null) {
 
 					try {
 						// Check for modification to storage of next record
@@ -2614,7 +2634,7 @@ public class Table {
 						}
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 				return hasPrev;
@@ -2691,7 +2711,7 @@ public class Table {
 
 		@Override
 		public boolean hasNext() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (iterCnt <= SHORT_ITER_THRESHOLD && ++iterCnt > SHORT_ITER_THRESHOLD) {
 					// Switch to long-running iterator
 					keyIter =
@@ -2703,7 +2723,7 @@ public class Table {
 
 		@Override
 		public boolean hasPrevious() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (iterCnt <= SHORT_ITER_THRESHOLD && ++iterCnt > SHORT_ITER_THRESHOLD) {
 					// Switch to long-running iterator
 					keyIter =
@@ -2785,11 +2805,11 @@ public class Table {
 				else {
 					try {
 						LongKeyRecordNode leaf =
-							(LongKeyRecordNode) nodeMgr.getLongKeyNode(bufferId);
+							(LongKeyRecordNode) nm().getLongKeyNode(bufferId);
 						getKeys(leaf);
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 			}
@@ -2841,7 +2861,7 @@ public class Table {
 			try {
 				LongKeyRecordNode leaf = null;
 				if (keys == null || keys.length == 0) {
-					LongKeyNode rootNode = nodeMgr.getLongKeyNode(rootBufferId);
+					LongKeyNode rootNode = nm().getLongKeyNode(rootBufferId);
 					leaf = rootNode.getLeafNode(targetKey);
 
 					// Empty leaf node - special case
@@ -2915,7 +2935,7 @@ public class Table {
 				}
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 
 		}
@@ -2944,7 +2964,7 @@ public class Table {
 
 		@Override
 		public boolean hasNext() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (modCount != expectedModCount) {
 					reset();
 				}
@@ -2959,7 +2979,7 @@ public class Table {
 							if (bufferId == -1) {
 								return false;
 							}
-							LongKeyRecordNode leaf = ((LongKeyRecordNode) nodeMgr.getLongKeyNode(
+							LongKeyRecordNode leaf = ((LongKeyRecordNode) nm().getLongKeyNode(
 								bufferId)).getNextLeaf();
 							if (leaf == null || leaf.getKey(0) > maxKey) {
 								return false;
@@ -2971,7 +2991,7 @@ public class Table {
 							hasPrev = false;
 						}
 						finally {
-							nodeMgr.releaseNodes();
+							nm().releaseNodes();
 						}
 					}
 
@@ -2992,7 +3012,7 @@ public class Table {
 
 		@Override
 		public boolean hasPrevious() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (modCount != expectedModCount) {
 					reset();
 				}
@@ -3007,7 +3027,7 @@ public class Table {
 							if (bufferId == -1) {
 								return false;
 							}
-							LongKeyRecordNode leaf = ((LongKeyRecordNode) nodeMgr.getLongKeyNode(
+							LongKeyRecordNode leaf = ((LongKeyRecordNode) nm().getLongKeyNode(
 								bufferId)).getPreviousLeaf();
 							if (leaf == null) {
 								return false;
@@ -3023,7 +3043,7 @@ public class Table {
 							hasPrev = true;
 						}
 						finally {
-							nodeMgr.releaseNodes();
+							nm().releaseNodes();
 						}
 					}
 
@@ -3068,7 +3088,7 @@ public class Table {
 		@Override
 		public boolean delete() throws IOException {
 			if (hasLastKey) {
-				synchronized (db) {
+				try (DBHandle.LockScope dbLock = db.lockWrite()) {
 					long deleteKey = lastKey;
 					hasLastKey = false;
 					boolean success = deleteRecord(deleteKey);
@@ -3150,7 +3170,7 @@ public class Table {
 
 			try {
 				LongKeyRecordNode leaf = null;
-				LongKeyNode rootNode = nodeMgr.getLongKeyNode(rootBufferId);
+				LongKeyNode rootNode = nm().getLongKeyNode(rootBufferId);
 
 				leaf = rootNode.getLeafNode(targetKey);
 				bufferId = leaf.getBufferId();
@@ -3185,7 +3205,7 @@ public class Table {
 				}
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 
 		}
@@ -3202,7 +3222,7 @@ public class Table {
 
 		@Override
 		public boolean hasNext() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (modCount != expectedModCount) {
 					reset();
 				}
@@ -3218,7 +3238,7 @@ public class Table {
 					try {
 						// Process next leaf if needed
 						LongKeyRecordNode leaf =
-							(LongKeyRecordNode) nodeMgr.getLongKeyNode(bufferId);
+							(LongKeyRecordNode) nm().getLongKeyNode(bufferId);
 						if (nextIndex >= leaf.keyCount) {
 							leaf = leaf.getNextLeaf();
 							if (leaf == null) {
@@ -3247,7 +3267,7 @@ public class Table {
 						}
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 
 				}
@@ -3257,7 +3277,7 @@ public class Table {
 
 		@Override
 		public boolean hasPrevious() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (modCount != expectedModCount) {
 					reset();
 				}
@@ -3273,7 +3293,7 @@ public class Table {
 					try {
 						// Process previous leaf if needed
 						LongKeyRecordNode leaf =
-							(LongKeyRecordNode) nodeMgr.getLongKeyNode(bufferId);
+							(LongKeyRecordNode) nm().getLongKeyNode(bufferId);
 						if (prevIndex < 0) {
 							leaf = leaf.getPreviousLeaf();
 							if (leaf == null) {
@@ -3303,7 +3323,7 @@ public class Table {
 						}
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 				return hasPrev;
@@ -3388,7 +3408,7 @@ public class Table {
 					startKey = rightmostLeaf.getKeyField(rightmostLeaf.getKeyCount() - 1);
 				}
 				finally {
-					nodeMgr.releaseNodes();
+					nm().releaseNodes();
 				}
 			}
 
@@ -3397,7 +3417,7 @@ public class Table {
 
 		@Override
 		public boolean hasNext() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (iterCnt <= SHORT_ITER_THRESHOLD) {
 					if (++iterCnt > SHORT_ITER_THRESHOLD) {
 						// Switch to long-running iterator
@@ -3410,7 +3430,7 @@ public class Table {
 
 		@Override
 		public boolean hasPrevious() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (iterCnt <= SHORT_ITER_THRESHOLD) {
 					if (++iterCnt > SHORT_ITER_THRESHOLD) {
 						// Switch to long-running iterator
@@ -3486,7 +3506,7 @@ public class Table {
 						getKeys(leaf);
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 
@@ -3608,7 +3628,7 @@ public class Table {
 
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 
@@ -3640,7 +3660,7 @@ public class Table {
 
 		@Override
 		public boolean hasNext() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (modCount != expectedModCount) {
 					reset();
 				}
@@ -3669,7 +3689,7 @@ public class Table {
 							hasPrev = false;
 						}
 						finally {
-							nodeMgr.releaseNodes();
+							nm().releaseNodes();
 						}
 					}
 
@@ -3690,7 +3710,7 @@ public class Table {
 
 		@Override
 		public boolean hasPrevious() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (modCount != expectedModCount) {
 					reset();
 				}
@@ -3723,7 +3743,7 @@ public class Table {
 							hasPrev = true;
 						}
 						finally {
-							nodeMgr.releaseNodes();
+							nm().releaseNodes();
 						}
 					}
 
@@ -3766,7 +3786,7 @@ public class Table {
 		@Override
 		public boolean delete() throws IOException {
 			if (lastKey != null) {
-				synchronized (db) {
+				try (DBHandle.LockScope dbLock = db.lockWrite()) {
 					Field deleteKey = lastKey;
 					lastKey = null;
 					boolean success = deleteRecord(deleteKey);
@@ -3899,7 +3919,7 @@ public class Table {
 
 			}
 			finally {
-				nodeMgr.releaseNodes();
+				nm().releaseNodes();
 			}
 		}
 
@@ -3919,7 +3939,7 @@ public class Table {
 
 		@Override
 		public boolean hasNext() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (modCount != expectedModCount) {
 					reset();
 				}
@@ -3963,7 +3983,7 @@ public class Table {
 						}
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 				return hasNext;
@@ -3972,7 +3992,7 @@ public class Table {
 
 		@Override
 		public boolean hasPrevious() throws IOException {
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockRead()) {
 				if (modCount != expectedModCount) {
 					reset();
 				}
@@ -4017,7 +4037,7 @@ public class Table {
 						}
 					}
 					finally {
-						nodeMgr.releaseNodes();
+						nm().releaseNodes();
 					}
 				}
 				return hasPrev;
@@ -4062,7 +4082,7 @@ public class Table {
 	 * @return true if table is valid and has not been invalidated
 	 */
 	public boolean isInvalid() {
-		return nodeMgr == null;
+		return nm() == null;
 	}
 
 	@Override

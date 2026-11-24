@@ -619,7 +619,7 @@ public class PackedDatabase extends Database {
 	 */
 	public static void packDatabase(DBHandle dbh, String itemName, String contentType,
 			File outputFile, TaskMonitor monitor) throws CancelledException, IOException {
-		synchronized (dbh) {
+		try (db.DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			if (isReadOnlyPDBDirectory(new ResourceFile(outputFile.getParentFile()))) {
 				throw new ReadOnlyException(
 					"Read-only DB directory lock, file creation not allowed: " + outputFile);

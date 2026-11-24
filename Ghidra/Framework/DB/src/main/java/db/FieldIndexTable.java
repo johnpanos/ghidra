@@ -343,7 +343,7 @@ public class FieldIndexTable extends IndexTable {
 			if (lastKey == null) {
 				return false;
 			}
-			synchronized (db) {
+			try (DBHandle.LockScope dbLock = db.lockWrite()) {
 				Field[] keys = findPrimaryKeys(lastKey.getIndexedField());
 				for (Field key : keys) {
 					primaryTable.deleteRecord(key);

@@ -17,6 +17,8 @@ package db.buffers;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import db.DBChangeSet;
 import db.DBHandle;
@@ -82,6 +84,20 @@ public class BufferMgr {
 	private int cacheSize;
 	private int buffersOnHand;
 	private int lockCount = 0;
+
+	// Depth of shared (read-only) database access held by each thread; see DBHandle.lockRead.
+	// While > 0, getBuffer pins clean buffers so several readers can hold the same buffer.
+	private final ThreadLocal<int[]> sharedReadDepth = ThreadLocal.withInitial(() -> new int[1]);
+
+	/** Mark the current thread as a shared reader (re-entrant). */
+	public void enterSharedRead() {
+		sharedReadDepth.get()[0]++;
+	}
+
+	/** Undo one {@link #enterSharedRead()}. */
+	public void exitSharedRead() {
+		sharedReadDepth.get()[0]--;
+	}
 
 	/**
 	 * Available memory cache buffers
@@ -624,6 +640,19 @@ public class BufferMgr {
 
 		// Get oldest buffer node in cache
 		BufferNode oldNode = cacheTail.prevCached;
+		if (oldNode.id == HEAD && !sharedPins.isEmpty()) {
+			// every cached buffer is checked out; idle shared-reader pins can be given back, and
+			// buffers pinned by concurrent readers must not make a read fail: exceed the cache
+			// limit by one buffer instead (bounded by readers x tree depth)
+			for (SharedPin pin : new ArrayList<>(sharedPins.values())) {
+				killPin(pin);
+			}
+			oldNode = cacheTail.prevCached;
+			if (oldNode.id == HEAD) {
+				++cacheSize;
+				return new DataBuffer(cacheFile.getBufferSize());
+			}
+		}
 		if (oldNode.id == HEAD) {
 			// cache limit has been exceeded
 			throw new IOException("Out of cache buffer space");
@@ -960,7 +989,14 @@ public class BufferMgr {
 	 * @return buffer object, or null if buffer not found
 	 * @throws IOException if source or cache file access error occurs
 	 */
-	public synchronized DataBuffer getBuffer(int id) throws IOException {
+	public DataBuffer getBuffer(int id) throws IOException {
+		if (sharedReadDepth.get()[0] > 0) {
+			return getSharedBuffer(id);
+		}
+		return getExclusiveBuffer(id);
+	}
+
+	private synchronized DataBuffer getExclusiveBuffer(int id) throws IOException {
 
 		if (corruptedState) {
 			throw new IOException("Corrupted BufferMgr state");
@@ -993,6 +1029,114 @@ public class BufferMgr {
 	 * @return buffer object, or null if buffer not found
 	 * @throws IOException if a cache file access error occurs
 	 */
+
+	// ---- Shared (read-only) buffer pins ----------------------------------------------------
+	// A shared reader (DBHandle.lockRead) checks a buffer out read-only. The first reader takes
+	// the buffer out of the memory cache (so it cannot be evicted) and publishes it in
+	// sharedPins; further readers bump its count without this object's monitor. When the count
+	// drops to zero the pin stays idle so the next reader also skips the monitor, unless too many
+	// pins are idle. Count -1 marks a dead pin: only the monitor kills a pin (CAS 0 -> -1, then
+	// unlock and return the buffer to the cache), and the lock-free path only acquires live ones.
+	// A writer calls releaseSharedPins() when it takes the database write lock, so no pin exists
+	// while anything is modified, checkpointed or saved.
+
+	private static final int MAX_IDLE_SHARED_PINS = 4096;
+
+	private static final class SharedPin {
+		final DataBuffer buffer;
+		final AtomicInteger count = new AtomicInteger(1);
+
+		SharedPin(DataBuffer buffer) {
+			this.buffer = buffer;
+		}
+
+		boolean tryAcquire() {
+			for (;;) {
+				int c = count.get();
+				if (c < 0) {
+					return false;
+				}
+				if (count.compareAndSet(c, c + 1)) {
+					return true;
+				}
+			}
+		}
+	}
+
+	private final ConcurrentHashMap<Integer, SharedPin> sharedPins = new ConcurrentHashMap<>();
+
+	private DataBuffer getSharedBuffer(int id) throws IOException {
+		SharedPin pin = sharedPins.get(id);
+		if (pin != null && pin.tryAcquire()) {
+			return pin.buffer;
+		}
+		synchronized (this) {
+			if (corruptedState) {
+				throw new IOException("Corrupted BufferMgr state");
+			}
+			pin = sharedPins.get(id);
+			if (pin != null && pin.tryAcquire()) { // pins in the map are live under the monitor
+				return pin.buffer;
+			}
+			BufferNode node = getBufferNode(id, true); // loads buffer into memory cache
+			DataBuffer buf = node.buffer;
+			if (node.empty || buf.isEmpty()) {
+				throw new IOException("Invalid buffer: " + id);
+			}
+			removeFromCache(node);
+			node.locked = true;
+			++lockCount;
+			sharedPins.put(id, new SharedPin(buf));
+			return buf;
+		}
+	}
+
+	private void releaseShared(SharedPin pin) throws IOException {
+		if (pin.count.decrementAndGet() == 0 &&
+			sharedPins.size() > Math.min(MAX_IDLE_SHARED_PINS, maxCacheSize / 4)) {
+			synchronized (this) {
+				if (sharedPins.get(pin.buffer.getId()) == pin) {
+					killPin(pin);
+				}
+			}
+		}
+	}
+
+	/** Must hold the monitor. Unpins an idle pin; a pin in use is left alone. */
+	private boolean killPin(SharedPin pin) throws IOException {
+		if (!pin.count.compareAndSet(0, -1)) {
+			return false;
+		}
+		int id = pin.buffer.getId();
+		sharedPins.remove(id);
+		BufferNode node = getCachedBufferNode(id);
+		if (node == null || !node.locked) {
+			handleCorruptionException(new AssertException("Shared buffer not locked: " + id),
+				"BufferMgr shared buffer release failed");
+		}
+		node.locked = false;
+		--lockCount;
+		returnToCache(node, pin.buffer);
+		return true;
+	}
+
+	/**
+	 * Return all idle shared-reader pins to the cache. Called by the database when exclusive
+	 * access is acquired (no reader can be active then).
+	 * @throws IOException if the buffer state is corrupt
+	 */
+	public synchronized void releaseSharedPins() throws IOException {
+		if (sharedPins.isEmpty()) {
+			return;
+		}
+		for (SharedPin pin : new ArrayList<>(sharedPins.values())) {
+			if (!killPin(pin)) {
+				Msg.error(this, "Shared buffer still in use at exclusive access: " +
+					pin.buffer.getId());
+			}
+		}
+	}
+
 	public DataBuffer createBuffer() throws IOException {
 		synchronized (snapshotLock) {
 			synchronized (this) {
@@ -1030,6 +1174,13 @@ public class BufferMgr {
 	 */
 	public void releaseBuffer(DataBuffer buf) throws IOException {
 
+		if (!buf.isDirty()) {
+			SharedPin pin = sharedPins.get(buf.getId());
+			if (pin != null && pin.buffer == buf) {
+				releaseShared(pin);
+				return;
+			}
+		}
 		try {
 			if (buf.isDirty()) {
 				releaseDirtyBuffer(buf);
@@ -1093,6 +1244,9 @@ public class BufferMgr {
 
 				if (node != null && !node.locked) {
 					throw new AssertException();
+				}
+				if (sharedPins.containsKey(id)) {
+					throw new AssertException("Shared (read-only) buffer was modified: " + id);
 				}
 
 				++modCount;

@@ -116,7 +116,7 @@ class DbViewerComponent extends JPanel {
 		if (dbh == null) {
 			return;
 		}
-		synchronized (dbh) {
+		try (db.DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			updateTableChoices((TableItem) combo.getSelectedItem());
 			updateTable();
 		}
@@ -127,7 +127,7 @@ class DbViewerComponent extends JPanel {
 			removeWidgets();
 			return;
 		}
-		synchronized (dbh) {
+		try (db.DBHandle.LockScope dbLock = dbh.lockWrite()) {
 			updateTable();
 		}
 	}
