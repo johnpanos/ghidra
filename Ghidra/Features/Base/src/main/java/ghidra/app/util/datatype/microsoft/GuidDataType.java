@@ -68,6 +68,13 @@ public class GuidDataType extends BuiltIn {
 	}
 
 	@Override
+	public String getCTypeDeclaration(DataOrganization dataOrganization) {
+		// Same layout as the Windows SDK's struct _GUID (16 bytes, 4-byte aligned).
+		return "typedef struct { unsigned int Data1; unsigned short Data2; unsigned short Data3; " +
+			"unsigned char Data4[8]; } " + NAME + ";";
+	}
+
+	@Override
 	public String getMnemonic(Settings settings) {
 		return NAME;
 	}

@@ -147,6 +147,13 @@ public abstract class BuiltIn extends DataTypeImpl implements BuiltInDataType {
 		if ((this instanceof Dynamic) || (this instanceof FactoryDataType)) {
 			return null;
 		}
+		if (!(this instanceof AbstractIntegerDataType) && !(this instanceof AbstractFloatDataType) &&
+			getLength() > dataOrganization.getLongLongSize()) {
+			// No C integer is this wide: an integer approximation would silently change the
+			// size of every structure containing this type. Keep the size exact instead.
+			return "typedef struct { unsigned char bytes[" + getLength() + "]; } " +
+				getDecompilerDisplayName(DecompilerLanguage.C_LANGUAGE) + ";";
+		}
 		return getCTypeDeclaration(this, false, dataOrganization, false);
 	}
 
