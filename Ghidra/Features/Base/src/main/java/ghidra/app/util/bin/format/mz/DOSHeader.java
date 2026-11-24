@@ -126,10 +126,10 @@ public class DOSHeader extends OldDOSHeader {
 			struct.add(new ArrayDataType(BYTE, getProgramLen(), 1));
 		}
 
-        struct.getComponent(14).setFieldName("e_res[4]");
+        struct.getComponent(14).setFieldName("e_res");
         struct.getComponent(15).setFieldName("e_oemid");
         struct.getComponent(16).setFieldName("e_oeminfo");
-        struct.getComponent(17).setFieldName("e_res2[10]");
+        struct.getComponent(17).setFieldName("e_res2");
         struct.getComponent(18).setFieldName("e_lfanew");
 		if (getProgramLen() > 0) {
         	struct.getComponent(19).setFieldName("e_program");

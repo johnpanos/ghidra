@@ -22,6 +22,7 @@ import java.util.*;
 import org.apache.commons.lang3.StringUtils;
 
 import ghidra.util.Msg;
+import ghidra.util.UniversalID;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.graph.DeterministicDependencyGraph;
 import ghidra.util.task.TaskMonitor;
@@ -52,6 +53,10 @@ public class DataTypeWriter {
 	private DeterministicDependencyGraph<CompositeNode> compositeDependencyGraph =
 		new DeterministicDependencyGraph<>();
 	private LinkedHashSet<DataType> deferredCompositeInternalTypes = new LinkedHashSet<>();
+	// Composite -> composites it embeds by value (directly, in arrays, or through typedefs).
+	// Edges are resolved only after all deferred types are written so that they never pull
+	// a composite into the graph which doWrite rejected (e.g. a same-named conflicting type).
+	private List<Composite[]> pendingCompositeDependencies = new ArrayList<>();
 
 	private int writerDepth = 0;
 	private Writer writer;
@@ -328,20 +333,45 @@ public class DataTypeWriter {
 	private void addCompositeToDependencyGraph(Composite composite, TaskMonitor monitor)
 			throws CancelledException {
 
-		// Each composite will be a node in the graph. Composite dependencies are added below.
+		// Each composite will be a node in the graph. Composite dependencies are recorded below
+		// and resolved by resolvePendingCompositeDependencies().
 		compositeDependencyGraph.addValue(new CompositeNode(composite));
 
 		for (DataTypeComponent component : composite.getDefinedComponents()) {
 
 			monitor.checkCancelled();
 
-			DataType dt = component.getDataType();
+			// A composite embedded by value must be complete before this body is written.
+			// That includes arrays of composites and typedefs of composites (e.g. LIST_ENTRY),
+			// but not pointers, which only need the forward declaration.
+			DataType dt = getBaseArrayTypedefType(component.getDataType());
 			if (dt instanceof Composite childComposite) {
-				CompositeNode start = new CompositeNode(composite);
-				CompositeNode end = new CompositeNode(childComposite);
+				pendingCompositeDependencies.add(new Composite[] { composite, childComposite });
+			}
+		}
+	}
+
+	private void resolvePendingCompositeDependencies() {
+		for (Composite[] edge : pendingCompositeDependencies) {
+			CompositeNode start = new CompositeNode(edge[0]);
+			CompositeNode end = new CompositeNode((Composite) edge[1].clone(dtm));
+			if (!compositeDependencyGraph.contains(end)) {
+				// The child was not accepted under its own identity; its C name refers to
+				// whichever composite was accepted with that name (if still pending).
+				DataType named = resolvedTypeMap.get(edge[1].getName());
+				if (!(named instanceof Composite namedComposite)) {
+					continue;
+				}
+				end = new CompositeNode(namedComposite);
+				if (!compositeDependencyGraph.contains(end)) {
+					continue; // already written in an earlier pass
+				}
+			}
+			if (compositeDependencyGraph.contains(start) && !start.equals(end)) {
 				compositeDependencyGraph.addDependency(start, end);
 			}
 		}
+		pendingCompositeDependencies.clear();
 	}
 
 	private void writeDeferredDeclarations(TaskMonitor monitor)
@@ -352,6 +382,7 @@ public class DataTypeWriter {
 			write(dt, monitor);
 		}
 
+		resolvePendingCompositeDependencies();
 		writeDeferredCompositeDeclarations(monitor);
 	}
 
@@ -429,7 +460,21 @@ public class DataTypeWriter {
 
 		String compositeType = composite instanceof Structure ? "struct" : "union";
 
+		// Non-packed composites have explicit component offsets (gaps are emitted as filler
+		// fields), so they must be laid out without compiler-inserted padding.
+		int pack = 0;
+		if (!composite.isPackingEnabled()) {
+			pack = 1;
+		}
+		else if (composite.hasExplicitPackingValue()) {
+			pack = composite.getExplicitPackingValue();
+		}
+
 		StringBuilder sb = new StringBuilder();
+		if (pack > 0) {
+			sb.append("#pragma pack(push, " + pack + ")");
+			sb.append(EOL);
+		}
 		sb.append(compositeType + " " + composite.getDisplayName() + " {");
 
 		String descrip = composite.getDescription();
@@ -445,6 +490,10 @@ public class DataTypeWriter {
 
 		sb.append(annotator.getSuffix(composite, null));
 		sb.append("};");
+		if (pack > 0) {
+			sb.append(EOL);
+			sb.append("#pragma pack(pop)");
+		}
 
 		writer.write(sb.toString());
 		writer.write(EOL);
@@ -460,6 +509,7 @@ public class DataTypeWriter {
 		if (fieldName == null || fieldName.length() == 0) {
 			fieldName = component.getDefaultFieldName();
 		}
+		fieldName = toCIdentifier(fieldName);
 
 		DataType componentDataType = component.getDataType();
 
@@ -508,6 +558,19 @@ public class DataTypeWriter {
 				if (dataType instanceof Array array) {
 					name += "[" + array.getNumElements() + "]";
 					dataType = array.getDataType();
+				}
+				else if (dataType instanceof Pointer pointer &&
+					pointer.getLength() > 0 &&
+					pointer.getLength() != dataOrganization.getPointerSize()) {
+					// e.g. 32-bit image-base-relative pointers in 64-bit programs: a C pointer
+					// would have the wrong size, so declare the integer that is stored.
+					String target = pointer.getDataType() == null ? "void"
+							: pointer.getDataType().getDisplayName();
+					componentString = dataOrganization.getIntegerCTypeApproximation(
+						pointer.getLength(), false) + " " + name + " " +
+						comment(pointer.getLength() * 8 + "-bit pointer to " + target);
+					sb.append(componentString);
+					return sb.toString();
 				}
 				else if (dataType instanceof Pointer pointer) {
 					DataType elem = pointer.getDataType();
@@ -729,6 +792,30 @@ public class DataTypeWriter {
 		writer.flush();
 	}
 
+	/**
+	 * Some loaders and demanglers produce field names that are not valid C (for example a
+	 * name with an embedded array dimension, "e_res[4]").  Map such names to an identifier.
+	 * @param name field name
+	 * @return a valid C identifier for the name
+	 */
+	static String toCIdentifier(String name) {
+		String n = name;
+		int bracket = n.indexOf('[');
+		if (bracket > 0 && n.endsWith("]")) {
+			n = n.substring(0, bracket); // the array dimension comes from the data type
+		}
+		StringBuilder sb = new StringBuilder(n.length());
+		for (int i = 0; i < n.length(); i++) {
+			char c = n.charAt(i);
+			boolean ok = c == '_' || (c < 128 && Character.isLetterOrDigit(c));
+			sb.append(ok ? c : '_');
+		}
+		if (sb.length() == 0 || Character.isDigit(sb.charAt(0))) {
+			sb.insert(0, '_');
+		}
+		return sb.toString();
+	}
+
 	private static String getArrayDimensions(Array arrayDt) {
 		String dimensionString = "[" + arrayDt.getNumElements() + "]";
 		DataType dataType = arrayDt.getDataType();
@@ -889,7 +976,9 @@ public class DataTypeWriter {
 
 		@Override
 		public int hashCode() {
-			return composite.hashCode();
+			// must agree with equals(), which compares universal IDs
+			UniversalID id = composite.getUniversalID();
+			return id != null ? id.hashCode() : System.identityHashCode(composite);
 		}
 
 		@Override
@@ -905,7 +994,11 @@ public class DataTypeWriter {
 			}
 
 			CompositeNode other = (CompositeNode) obj;
-			return composite.getUniversalID().equals(other.composite.getUniversalID());
+			UniversalID id = composite.getUniversalID();
+			if (id == null || other.composite.getUniversalID() == null) {
+				return composite == other.composite;
+			}
+			return id.equals(other.composite.getUniversalID());
 		}
 
 		@Override
