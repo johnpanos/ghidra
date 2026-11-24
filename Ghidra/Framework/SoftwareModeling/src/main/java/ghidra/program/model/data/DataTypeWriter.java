@@ -487,6 +487,13 @@ public class DataTypeWriter {
 			monitor.checkCancelled();
 			writeComponent(component, composite, sb, monitor);
 		}
+		if (composite.getNumComponents() == 0) {
+			// An empty (placeholder / not yet defined) composite still occupies its length in
+			// the program (1 byte when undefined); an empty C struct has size 0, which breaks
+			// pointer arithmetic and sizeof against the decompiled code.
+			sb.append("    unsigned char _placeholder_[" + Math.max(1, composite.getLength()) +
+				"];" + EOL);
+		}
 
 		sb.append(annotator.getSuffix(composite, null));
 		sb.append("};");
@@ -951,9 +958,9 @@ public class DataTypeWriter {
 		if (hasVarArgs) {
 			buf.append(ghidra.program.model.listing.FunctionSignature.VAR_ARGS_DISPLAY_STRING);
 		}
-		if ((n == 0) && (!hasVarArgs)) { // If no parameters
-			buf.append(VoidDataType.dataType.getName()); // Print "void" keyword
-		}
+		// No parameters: leave the declarator unprototyped "()". A FunctionDefinition does not
+		// record "(void)" vs "unknown", and many are the latter (e.g. the SDK declares FARPROC as
+		// "INT_PTR (WINAPI *)()"); "(void)" would reject the decompiled calls that pass arguments.
 		buf.append(")");
 		return buf.toString();
 	}
